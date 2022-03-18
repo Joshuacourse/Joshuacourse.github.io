@@ -1,0 +1,463 @@
+---
+title: "App Store Data Challenge"
+author: "Jia xu Luo"
+date: "3/18/2022"
+output: html_document
+---
+
+# Data Preparation
+```{r setup, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+knitr::opts_chunk$set(echo = TRUE)
+library(readr) # Read Rectangular Text Data
+library(dplyr) # A Grammar of Data Manipulation
+library(purrr) # Functional Programming Tools
+library(stringr) # Simple, Consistent Wrappers for Common String Operations
+library(tidyr) # Tidy Messy Data
+library(lubridate) # Make Dealing with Dates a Little Easier
+library(kableExtra) # Construct Complex Table with 'kable' and Pipe Syntax
+library(factoextra) # Extract and Visualize the Results of Multivariate Data Analyses
+library(FactoMineR) # Multivariate Exploratory Data Analysis and Data Mining
+library(gridExtra) # Miscellaneous Functions for "Grid" Graphics
+library(float)    # 32-Bit Floats
+library(recommenderlab) # Lab for Developing and Testing Recommender Algorithms
+```
+
+
+
+```{r prepare-data-1, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【1】Read Raw Data
+app <- read_csv("app_dat.csv")  
+category_ref <- read_csv("category_ref.csv")
+device_ref <- read_csv("device_ref.csv")
+in_app <- read_csv("in-app_dat.csv")
+transaction <- read_csv("transaction_dat.csv")
+account <- read.csv("account_dat.csv")
+
+
+```
+
+```{r prepare-data-2, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【2】Data Cleaning
+# (1)Transaction Table: Remove duplicates in the transaction tables
+transaction_cleaned <- transaction %>% 
+  distinct() %>% 
+  rename("transaction_date"=create_dt) %>% 
+  mutate(device_id=as.character(device_id))
+remove(transaction)
+
+kable(head(transaction_cleaned)) %>% kable_styling()
+
+```
+
+
+```{r prepare-data-3, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# (2) App Table & In App Table:  Remove wrongly label app_name ("#NAME?") 
+# Create parent_app_content_id and type columns so it could be combined with in_app table
+app_cleaned <- app %>% 
+  filter(app_name!="#NAME?") %>% 
+  mutate(type=NA,
+         parent_app_content_id=content_id,
+         device_id=as.character(device_id)) 
+
+app_and_in_app_cleaned <- in_app %>% 
+  left_join(app_cleaned,by=c("parent_app_content_id"="content_id")) %>% 
+  rename("type"=type.x) %>% 
+  select(names(app_cleaned)) %>% 
+  rbind.data.frame(app_cleaned)
+
+kable(head(app_and_in_app_cleaned)) %>% kable_styling()
+remove(app)
+remove(app_cleaned)
+remove(in_app)
+```
+
+
+```{r prepare-data-4, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# (3) Account Table: Fix the issue of mixed date format
+account_cleaned <- account %>% 
+  mutate(helper=as.character(map(create_dt,~str_split(.x,"/")[[1]][1]))) %>% 
+  mutate(account_creation_date=if_else(
+    str_length(helper)==4, ymd(create_dt), mdy(create_dt)
+  )) %>% 
+  select(-create_dt,-helper)
+kable(head(account_cleaned)) %>% kable_styling()
+remove(account)
+```
+
+
+```{r prepare-data-5, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# (4) Device Table
+device_ref_cleaned <- device_ref %>% 
+  mutate(device_id=as.character(device_id))
+kable(head(device_ref_cleaned)) %>% kable_styling()
+remove(device_ref)
+```
+
+```{r prepare-data-6,echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+#【3】Join the fact tables with dimension tables to create a transaction master table for downstream analysis
+# Filter out transactions without account information
+# Filter out transactions without app information
+# Filter out transactions where account_creation_date > transaction_date
+transaction_master_table <- transaction_cleaned %>% 
+  left_join(account_cleaned,by=c("acct_id"="acct_id")) %>% 
+  left_join(app_and_in_app_cleaned,by=c("content_id"="content_id")) %>% 
+  rename("device_id_from_transaction"=device_id.x,"device_id_from_app"=device_id.y) %>% 
+  left_join(device_ref_cleaned,by=c("device_id_from_transaction"="device_id")) %>% 
+  left_join(category_ref,by=c("category_id"="category_id")) %>% 
+  filter(!is.na(account_creation_date) ) %>% 
+  filter(!is.na(app_name)) %>% 
+  filter(account_creation_date<=transaction_date) 
+
+# write_csv(transaction_master_table,"transaction_master_table.csv")
+
+kable(head(transaction_master_table)) %>% kable_styling()
+remove(account_cleaned)
+remove(app_and_in_app_cleaned)
+remove(category_ref)
+remove(device_ref_cleaned)
+remove(transaction_cleaned)
+```
+
+
+```{r prepare-data-7, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+#【4】Add a column called "revenue_model" to the transaction_master_table (transaction level)
+# (1) If an app never charge users, it's a free app
+# (2) If an app charge users only when user download it, its a paid app
+# (3) If an app charge users in-app by consumable, its a freemium consumable app 
+# (4) If an app charge users in-app by subscription, its a freemium subscription app 
+
+app_with_revenue_model <- transaction_master_table %>% 
+  group_by(app_name,category_name,type) %>% 
+  summarise(total_sales=sum(price)) %>% 
+  mutate(revenue_model=
+           case_when(
+             is.na(type)  & total_sales==0  ~ "free app",
+             is.na(type) & total_sales>0 ~ "paid app",
+             type=="consumable" ~ "freemium consumable app",
+             type=="subscription" ~ "freemium subscription app "
+             
+           )
+  ) %>% 
+  arrange(app_name,category_name,type,desc(total_sales)) %>% 
+  filter(row_number()==1) %>% 
+  ungroup() %>% 
+  select(app_name,revenue_model)
+kable(head(app_with_revenue_model)) %>% kable_styling()
+
+transaction_master_table <- transaction_master_table %>% 
+  left_join(app_with_revenue_model,by=c("app_name"="app_name"))
+
+remove(app_with_revenue_model)
+```
+
+
+
+  
+```{r prepare-data-8, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【5】 # 2016-08-22， 2016-08-23， 2016-08-24 were missings
+transaction_date_diagnosis <- transaction_master_table %>%
+  group_by(transaction_date) %>%
+  summarise(total_price=sum(price)) %>%
+  arrange(transaction_date) %>%
+  mutate(helper=lag(transaction_date)) %>%
+  filter(transaction_date-helper!=1)
+
+kable(head(transaction_date_diagnosis)) %>% kable_styling()
+remove(transaction_date_diagnosis)
+```
+
+
+
+```{r prepare-data-9, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+#【6】Summary: in the downstream analysis
+
+summary <- sapply(transaction_master_table, function(x){length(unique(x))})
+kable(summary)
+
+# (1) There are 5 categories of app. 
+# (2) There are 2 devices. 
+# (3) There are 996 apps categorized into 4 types. 
+# (4) There are  28456 accounts 
+# (5) There are 2 payment types. 
+# (6) There are 110 days of data (2016-06-01 to 2016-09-21)
+# (7) There are 3454546 transactions (purchase + download)
+
+```
+
+
+```{r prepare-data-10, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【7】split transaction_master_table into downloads and purchases
+
+download_master_table <- transaction_master_table %>% 
+  filter(price==0)
+
+purchase_master_table <- transaction_master_table %>% 
+  filter(price>0)
+
+remove(transaction_master_table)
+
+```
+
+
+
+
+# KMeans Clustering
+```{r KMeans-1, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【1】Prepare Data for the K-Means Clustering Algorithm
+#  use the customer’s spending behavior, their products of interest and some basic 
+# information about their activity to perform segmentation.
+
+current_date <- max(purchase_master_table$transaction_date)
+customer_spending_behavior <- purchase_master_table %>%
+  group_by(acct_id) %>%
+  summarise(n_purchase = n(),
+            min_purchase = min(price),
+            avg_purchase = mean(price),
+            max_purchase = max(price),
+            total_purchase = sum(price),
+            first_purchase_date = min(transaction_date),
+            last_purchase_date = max(transaction_date)
+  ) %>%
+  mutate(days_since_first_purchase = as.integer(current_date - first_purchase_date),
+         days_since_last_purchase = as.integer(current_date - last_purchase_date)) %>% 
+  select(-first_purchase_date,-last_purchase_date)
+
+kable(head(customer_spending_behavior)) %>% kable_styling()
+
+```
+
+```{r KMeans-2, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# (2) customers' product interest 
+customer_product_interest = purchase_master_table %>%
+  group_by(acct_id) %>%
+  spread(category_name, price, fill = 0, convert = TRUE) %>%
+  dplyr::select(-transaction_date,-content_id,-device_id_from_transaction,-payment_type,
+                -account_creation_date,-app_name,-category_id,-device_id_from_app,
+                -type,-parent_app_content_id,-device_name,-revenue_model) %>%
+  group_by(acct_id) %>% summarise_all(.funs = sum)
+
+
+kable(head(customer_product_interest)) %>% kable_styling()
+```
+
+
+```{r KMeans-3, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# (3) join the two tables and remove acct_id
+customer_order_summary = customer_spending_behavior %>% left_join(customer_product_interest,
+                                                                  by=c("acct_id"="acct_id")) 
+account_id_cached <- customer_order_summary$acct_id
+
+customer_order_summary <- customer_order_summary %>% 
+  select(-acct_id)
+
+kable(head(customer_order_summary)) %>% kable_styling()
+
+remove(customer_product_interest)
+remove(customer_spending_behavior)
+
+```
+
+
+```{r KMeans-4, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【2】Determine the number of clusters
+# (1) scale the data
+scaled_cutomer_order_summary = as.data.frame(scale(customer_order_summary))
+# (2) Find optimal number of clusters for k-means
+fviz_nbclust(scaled_cutomer_order_summary, kmeans, method='silhouette')
+
+# As you can see above, the optimal number of clusters is 2 hands-down. So let’s choose k=2.
+
+```
+
+
+```{r KMeans-5, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【3】K-Means Clustering
+set.seed(123)
+# 3. Compute k-means
+km_model = kmeans(scaled_cutomer_order_summary, 2, nstart = 25)
+
+customer_order_summary$Cluster = km_model$cluster
+```
+
+```{r KMeans-6,echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【4】verify if the clusters were extracted correctly
+
+pca <- PCA(scaled_cutomer_order_summary,  graph = FALSE)
+fviz_screeplot(pca, addlabels = TRUE, ylim = c(0, 50))
+
+
+fviz_cluster(km_model, data = scaled_cutomer_order_summary,
+             axes = c(1,2),
+             geom = "point",
+             palette = c("#00AFBB", "#E7B800", "#FC4E07"),
+             ggtheme = theme_minimal(),
+             main = "Partitioning Clustering Plot Dim1 vs. Dim2")
+
+
+```
+
+
+```{r KMeans-7, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【5】detect which indicators along 40 variables distinguish our customers
+
+
+
+cluster_diff = customer_order_summary %>% group_by(Cluster) %>%
+  summarise('Number of Customers' = n(),
+            'Recency Mean (Day)' = round(mean(days_since_last_purchase),2),
+            'Frequency Mean' = scales::comma(round(mean(n_purchase))),
+            'Monetary Value Mean ($)' = scales::comma(round(mean(total_purchase))),
+            'Cluster Revenue' = scales::comma(sum(total_purchase)))
+
+kable(cluster_diff, caption = " Diffreence between the two clusters") %>% kable_styling()
+
+```
+
+
+
+  
+```{r KMeans-8, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【6】RFM Analysis
+customer_order_summary$Cluster = as.factor(customer_order_summary$Cluster)
+
+r = customer_order_summary %>%
+  ggplot(aes(x = Cluster, y = days_since_last_purchase, fill = Cluster)) +
+  geom_boxplot(fill = c("steelblue1", "gold3")) +
+  labs(x = "Cluster", y = "Number of Days",
+       title = "Recency: Distribution of Days since Last Order") +
+  scale_fill_brewer(palette="RdBu") + theme_minimal()
+
+
+f = customer_order_summary %>%
+  ggplot(aes(x = Cluster, y = n_purchase, fill = Cluster)) +
+  geom_boxplot(fill = c("steelblue1", "gold3")) +
+  labs(x = "Cluster", y = "Number of Transactions",
+       title = "Frequency: Distribution of Transactions") +
+  scale_fill_brewer(palette="RdBu") + theme_minimal()
+
+
+m = customer_order_summary %>%
+  ggplot(aes(x = Cluster, y = total_purchase, fill = Cluster)) +
+  geom_boxplot(fill = c("steelblue1", "gold3")) +
+  labs(x = "Cluster", y = "Order Value (£)",
+       title = "Monetary: Distribution of Order Value") +
+  scale_fill_brewer(palette="RdBu") + theme_minimal()
+
+grid.arrange(r, f, m, nrow = 3)
+remove(r,f,m)
+```
+
+
+
+```{r KMeans-9, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【7】 Products of Interest within each Cluster
+
+product_stats_cluster =  customer_order_summary %>%
+  dplyr::select( -n_purchase, -min_purchase, -avg_purchase,
+                 -max_purchase, -total_purchase, -days_since_first_purchase, -days_since_last_purchase)
+
+product_stats_cluster = 
+  product_stats_cluster %>% gather(key = "ProductCategory", value = "BasketValue", -Cluster) 
+
+product_stats_cluster %>% 
+  filter(ProductCategory %in% c("Entertainment", "Games", 
+                                "Photos & Videos", "Social Networking",
+                                "Utilities")) %>%
+  ggplot(aes(x = ProductCategory, BasketValue)) +
+  stat_summary(fun.y=sum,geom="bar",fill="#CC6666",colour="black") +
+  labs(x = "Product Category", y = "Sales Revenue (£)",
+       title = "") +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  facet_wrap(~Cluster, scales = "free") 
+
+```
+
+
+# Recommendation System
+
+```{r RS-1, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【1】Prepare for the data
+apps_matrix <- purchase_master_table %>% 
+  group_by(acct_id,app_name) %>% 
+  summarise(if_purchased=n()) %>% 
+  ungroup() %>% 
+  spread(app_name, if_purchased)
+
+
+kable(head(apps_matrix)) %>% kable_styling()
+
+```
+
+```{r RS-2, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【2】Split the dataset into training set (80%) and testing set (20%):
+set.seed(80)
+train_set <- sample(x = c(TRUE, FALSE), size = nrow(apps_matrix), replace = TRUE, 
+                    prob = c(0.8, 0.2))
+
+account_id <- apps_matrix$acct_id  
+apps_matrix <- apps_matrix %>% select(-acct_id)
+rownames(apps_matrix) <- account_id
+
+Train_account_id <- account_id[train_set] # 12034
+Test_account_id <- account_id[!train_set] # 2959
+
+
+apps_matrix <- as(as.matrix(apps_matrix), "realRatingMatrix")
+apps_Train <- apps_matrix[train_set, ] 
+# 12025 x 772
+apps_Test <- apps_matrix[!train_set, ]
+# 2957 x 772
+
+
+```
+
+
+```{r RS-3, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【3】Training the model
+recommender <- Recommender(apps_Train, method = "IBCF", parameter = list(k = 30))
+
+```
+
+
+```{r RS-4, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【4】Top Apps based on co-purchase pattern
+similarityMatrix <- getModel(recommender)$sim
+similarity <- as.matrix(recommender@model$sim)
+
+which_max <- order(colSums(similarityMatrix > 0), decreasing = TRUE)[1:10]
+topApps <- as.data.frame((rownames(similarityMatrix)[which_max]))
+colnames(topApps) ="Top Apps"
+
+kable((topApps)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  row_spec(0, bold = T, color = "white", background = "#fc5e5e") %>%
+  scroll_box(width = "100%", height = "600px")
+# You can get a glimpse of how the similarity metric look like
+kable(head(similarity)) %>% kable_styling()
+
+```
+
+
+```{r RS-5, echo=TRUE, warning=FALSE, message=FALSE,results='asis'}
+# 【5】Recommendations using test set
+pred <- predict(recommender, newdata = apps_Test, n = 6)
+
+
+prediction_table<- as(pred,"list") %>% 
+  as.data.frame() %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  tibble::rownames_to_column( "account_id") %>% 
+  rename("app1"=V1,
+         "app2"=V2,
+         "app3"=V3,
+         "app4"=V4,
+         "app5"=V5,
+         "app6"=V6,
+  ) 
+kable((prediction_table)) %>%
+  kable_styling(bootstrap_options = c("striped", "hover", "condensed", "responsive")) %>%
+  row_spec(0, bold = T, color = "white", background = "#fc5e5e") %>%
+  scroll_box(width = "100%", height = "800px")
+```
+
